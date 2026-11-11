@@ -1,0 +1,6 @@
+.venv/
+data/*.parquet
+checkpoints/
+spark-warehouse/
+env.cmd
+__pycache__/
