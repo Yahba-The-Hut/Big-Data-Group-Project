@@ -2,6 +2,8 @@
 # streaming_classifier.py
 
 import argparse
+from pathlib import Path
+
 from pyspark.sql import SparkSession, functions as F
 from pyspark.ml import PipelineModel
 
@@ -13,16 +15,21 @@ p.add_argument('--checkpoint', required=True)
 a = p.parse_args()
 
 # Create Spark session
-spark = SparkSession.builder \
-    .appName('GP1-LiveClassifier') \
+spark = (
+    SparkSession.builder
+    .appName('GP1-LiveClassifier')
     .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel("WARN")
 
 # Load saved trained model
 model = PipelineModel.load(a.model_dir)
 
 # Read Kafka topic1 continuously
 raw = (
-    spark.readStream.format("kafka")
+    spark.readStream
+    .format("kafka")
     .option("kafka.bootstrap.servers", a.bootstrap)
     .option("subscribe", "topic1")
     .option("startingOffsets", "earliest")
@@ -46,21 +53,53 @@ text = msgs.where(
     (F.length(F.trim(F.col("text"))) > 0)
 )
 
-# Apply previously saved PipelineModel
-pred = model.transform(text)
+# -----------------------------------------
+# QUERY 1: Display incoming Kafka messages
+# -----------------------------------------
 
-# Group predictions by numeric class
-counts = pred.groupBy("prediction").count()
-
-# Display cumulative counts every 30 seconds
-q = (
-    counts.writeStream
-    .outputMode("complete")
+messages_query = (
+    text.writeStream
+    .outputMode("append")
     .format("console")
     .option("truncate", "false")
-    .option("checkpointLocation", a.checkpoint)
+    .option(
+        "checkpointLocation",
+        str(Path(a.checkpoint) / "messages")
+    )
     .trigger(processingTime="30 seconds")
     .start()
 )
 
-q.awaitTermination()
+# -----------------------------------------
+# QUERY 2: Real-time classification
+# -----------------------------------------
+
+# Apply previously saved PipelineModel
+pred = model.transform(text)
+
+# Group predictions by numeric class
+counts = (
+    pred.groupBy("prediction")
+    .count()
+)
+
+# Display cumulative counts every 30 seconds
+classification_query = (
+    counts.writeStream
+    .outputMode("complete")
+    .format("console")
+    .option("truncate", "false")
+    .option(
+        "checkpointLocation",
+        str(Path(a.checkpoint) / "classification")
+    )
+    .trigger(processingTime="30 seconds")
+    .start()
+)
+
+print("Streaming classifier started!")
+print("Reading messages from Kafka topic1...")
+print("Displaying prediction counts every 30 seconds...")
+
+# Keep both streaming queries running
+spark.streams.awaitAnyTermination()
