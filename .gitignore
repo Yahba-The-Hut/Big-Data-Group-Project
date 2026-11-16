@@ -3,4 +3,4 @@ data/*.parquet
 checkpoints/
 spark-warehouse/
 env.cmd
-__pycache__/
+__pycache__/.venv-wsl/
