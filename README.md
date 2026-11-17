@@ -148,25 +148,73 @@ See `HANDOFF_Members_2_and_4.md` for the handoff details.
 
 ## Part 2: Named entities, counts, Kibana (Member 2)
 
-`streaming_ner.py` reads `topic1` with Spark Structured Streaming, extracts PERSON, ORG, and GPE entities with spaCy (`en_core_web_sm`), and publishes `{"entity", "count", "batch_id"}` JSON to `topic2` every 10 seconds.
-
-```bash
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0 streaming_ner.py
+```
+topic1 → streaming_ner.py (spaCy NER, running counts) → topic2 → Logstash → Elasticsearch (gp1-entities) → Kibana top-10 chart
 ```
 
-Check output:
+`streaming_ner.py` reads `topic1` with Spark Structured Streaming, extracts PERSON, ORG, and GPE entities with spaCy (`en_core_web_sm`), keeps a **cumulative** count per entity (stateful `groupBy` in complete mode), and publishes `{"entity", "count", "batch_id"}` JSON to `topic2` every 30 seconds. Entities are lowercased so "Apple" and "apple" count together.
+
+### 1. Start the entity stream
+
+Kafka must be running first (Part 1).
+
+```bash
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0 \
+  streaming_ner.py --checkpoint ./checkpoints/entities
+```
+
+Check that counts reach `topic2`:
 
 ```bash
 docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic topic2 --from-beginning --max-messages 5
 ```
 
-Offline helpers (read `data/messages.jsonl`, no Kafka needed):
+Expected: lines like `{"entity":"google","count":37,"batch_id":4}`. A given entity's count goes up over time and never resets.
+
+### 2. Start Elasticsearch, Kibana, Logstash
+
+`docker-compose.elastic.yml` runs all three. Logstash shares the Kafka container's network so it reaches Kafka at `localhost:9092` without changing Member 1's setup. Security is disabled (local demo only).
+
+```bash
+docker start kafka                                     # if not already running
+docker compose -f docker-compose.elastic.yml up -d
+curl http://localhost:9200                             # Elasticsearch responds with version JSON
+docker logs -f gp1-logstash                            # shows each indexed entity document
+```
+
+Kibana takes 1 to 2 minutes to start. Open http://localhost:5601.
+
+`logstash.conf` indexes `topic2` into `gp1-entities` with **`document_id => "%{entity}"`**, so each new cumulative count replaces that entity's previous document instead of adding to it. Check the index:
+
+```bash
+curl "http://localhost:9200/gp1-entities/_count"
+curl "http://localhost:9200/gp1-entities/_search?size=5&sort=count:desc&pretty"
+```
+
+### 3. Build the top-10 chart in Kibana
+
+1. **Stack Management → Data Views → Create data view.** Name and index pattern `gp1-entities`. Set the timestamp field to **"I don't want to use the time filter"** so all entities show.
+2. **Visualize Library → Create visualization → Lens.**
+3. Chart type: **Bar horizontal**.
+4. Vertical axis: **Top values** of `entity.keyword`, **10** values, ranked by the metric below.
+5. Horizontal axis: **Maximum** of `count`. Each entity has one document, so max = current count.
+6. Save it (for example "GP1 Top 10 Entities") and add it to a dashboard.
+
+### 4. Evidence
+
+- `topic2` console consumer output
+- Kibana chart screenshots at several times while the producer runs (for example 15 / 30 / 45 / 60 minutes) showing the ranking and counts change
+- `curl .../gp1-entities/_count` output
+
+Stop everything with `docker compose -f docker-compose.elastic.yml down`. Add `-v` to also delete the Elasticsearch data.
+
+### Offline helpers
+
+These read `data/messages.jsonl` and need no Kafka:
 
 - `python test_ner.py`: quick spaCy + Spark sanity check
 - `python entity_counts.py`: prints the top 20 entities across the whole file
-
-<!-- Member 2: add logstash.conf, Elasticsearch/Kibana setup, and the top-10 chart screenshots here. -->
 
 ---
 
