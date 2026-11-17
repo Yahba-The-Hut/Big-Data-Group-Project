@@ -1,114 +1,113 @@
+"""Member 2: streaming named-entity counts.
 
-import spacy
+Reads Hacker News messages from Kafka topic1, extracts named entities with
+spaCy, keeps RUNNING (cumulative) counts per entity across the whole stream,
+and publishes the full current count table to Kafka topic2 every trigger:
+
+    key   = entity (lowercased)
+    value = {"entity": "microsoft", "count": 42, "batch_id": 5}
+
+Logstash indexes topic2 into Elasticsearch using the entity as the document
+id, so each new count replaces the previous one (see logstash.conf).
+
+Run (needs the Spark Kafka connector):
+    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0 \
+        streaming_ner.py --checkpoint ./checkpoints/entities
+"""
+
+import argparse
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, ArrayType
+from pyspark.sql.types import ArrayType, StringType
 
-# Load spaCy once per Python worker
+ENTITY_LABELS = ("PERSON", "ORG", "GPE")
+
+p = argparse.ArgumentParser()
+p.add_argument("--bootstrap", default="localhost:9092")
+p.add_argument("--input-topic", default="topic1")
+p.add_argument("--output-topic", default="topic2")
+p.add_argument("--checkpoint", default="./checkpoints/entities")
+p.add_argument("--trigger", default="30 seconds")
+a = p.parse_args()
+
+# Load spaCy lazily, once per Python worker
 _nlp = None
+
 
 def extract_entities(text):
     global _nlp
-
     if not text:
         return []
-
     if _nlp is None:
+        import spacy
         _nlp = spacy.load("en_core_web_sm")
-
     doc = _nlp(text)
-
     return [
-        ent.text.strip()
+        ent.text.strip().lower()
         for ent in doc.ents
-        if ent.label_ in ("PERSON", "ORG", "GPE")
-        and ent.text.strip()
+        if ent.label_ in ENTITY_LABELS and ent.text.strip()
     ]
 
 
-# Start Spark
-spark = (
-    SparkSession.builder
-    .appName("Member2StreamingNER")
-    .master("local[2]")
-    .getOrCreate()
-)
+ner_udf = F.udf(extract_entities, ArrayType(StringType()))
 
-spark.sparkContext.setLogLevel("ERROR")
+spark = SparkSession.builder.appName("GP1-EntityCounts").getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
 
-# Kafka message schema
-schema = StructType([
-    StructField("id", StringType()),
-    StructField("text", StringType()),
-    StructField("source", StringType()),
-    StructField("collected_at", StringType())
-])
-
-# Read streaming messages from topic1
-kafka_df = (
-    spark.readStream
-    .format("kafka")
-    .option("kafka.bootstrap.servers", "localhost:9092")
-    .option("subscribe", "topic1")
+raw = (
+    spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", a.bootstrap)
+    .option("subscribe", a.input_topic)
     .option("startingOffsets", "earliest")
     .load()
 )
 
-# Convert Kafka JSON messages into columns
-messages = (
-    kafka_df
-    .select(F.from_json(F.col("value").cast("string"), schema).alias("data"))
-    .select("data.*")
-    .filter(F.col("text").isNotNull())
+texts = raw.select(
+    F.get_json_object(F.col("value").cast("string"), "$.text").alias("text")
+).where(F.col("text").isNotNull() & (F.length(F.trim("text")) > 0))
+
+# Stateful aggregation: Spark keeps the running count for every entity
+# across all micro-batches (stored in the checkpoint).
+counts = (
+    texts.select(F.explode(ner_udf("text")).alias("entity"))
+    .groupBy("entity")
+    .count()
 )
 
-# Extract named entities
-ner_udf = F.udf(extract_entities, ArrayType(StringType()))
 
-entities = (
-    messages
-    .withColumn("entity", F.explode(ner_udf(F.col("text"))))
-)
-
-# Process each micro-batch and publish entity counts
-def process_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
+def publish(batch_df, batch_id):
+    # In complete mode, batch_df is the FULL cumulative count table.
+    n = batch_df.count()
+    if n == 0:
         return
-
-    counts = batch_df.groupBy("entity").count()
-
-    output = (
-        counts
-        .withColumn("batch_id", F.lit(batch_id))
-        .select(
+    (
+        batch_df.select(
             F.col("entity").cast("string").alias("key"),
             F.to_json(
-                F.struct("entity", "count", "batch_id")
-            ).alias("value")
+                F.struct(
+                    F.col("entity"),
+                    F.col("count"),
+                    F.lit(batch_id).alias("batch_id"),
+                )
+            ).alias("value"),
         )
-    )
-
-    (
-        output.write
-        .format("kafka")
-        .option("kafka.bootstrap.servers", "localhost:9092")
-        .option("topic", "topic2")
+        .write.format("kafka")
+        .option("kafka.bootstrap.servers", a.bootstrap)
+        .option("topic", a.output_topic)
         .save()
     )
+    print(f"batch {batch_id}: published cumulative counts for {n} entities", flush=True)
+    batch_df.orderBy(F.desc("count")).show(10, truncate=False)
 
-    print(f"Published entity counts for batch {batch_id}")
 
-
-# Start streaming
 query = (
-    entities.writeStream
-    .foreachBatch(process_batch)
-    .option("checkpointLocation", "/tmp/member2_ner_checkpoint")
-    .trigger(processingTime="10 seconds")
+    counts.writeStream.outputMode("complete")
+    .foreachBatch(publish)
+    .option("checkpointLocation", a.checkpoint)
+    .trigger(processingTime=a.trigger)
     .start()
 )
 
-print("Streaming NER pipeline started.")
-print("Reading topic1 and publishing entity counts to topic2.")
-
+print(f"Streaming NER started: {a.input_topic} -> running entity counts -> {a.output_topic}")
 query.awaitTermination()
