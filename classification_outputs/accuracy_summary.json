@@ -1,5 +1,8 @@
 {
+    "raw_messages": 4354,
+    "clean_messages": 4348,
     "total_labeled": 50,
+    "none_of_these": 0,
     "eligible_messages": 50,
     "correct_predictions": 27,
     "accuracy_percent": 54.0

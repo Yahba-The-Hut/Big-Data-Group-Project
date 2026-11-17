@@ -1,277 +1,184 @@
-import os
-import json
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+"""Member 4: batch classification and manual-label evaluation.
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, trim, length, lit, rand,
-    create_map, array_max, monotonically_increasing_id
-)
+Loads the saved Part 3 PipelineModel (no retraining), classifies the collected
+Hacker News messages, exports predictions with confidence, samples 50 messages
+for hand labeling, and computes accuracy on the labeled sample.
+
+Run from the project root:
+    python classification_evaluation_local.py
+
+Optional arguments:
+    --messages   path to collected messages (default: data/messages.jsonl)
+    --model-dir  path to saved model         (default: models/ag_news_pipeline)
+    --output-dir where outputs are written    (default: classification_outputs)
+"""
+
+import argparse
+import json
+import os
+from itertools import chain
+
+import pandas as pd
 from pyspark.ml import PipelineModel
 from pyspark.ml.functions import vector_to_array
-from pyspark.ml import PipelineModel
-
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    ConfusionMatrixDisplay
-)
-
 from pyspark.sql import SparkSession
-from pathlib import Path
+from pyspark.sql.functions import array_max, col, create_map, length, lit, rand, trim
 
-BASE_DIR = Path(r"C:\\Users\\hanna\\Documents\\cs4371\\Big-Data-Group-Project-Phil")
+LABEL_MAP = {0: "World", 1: "Sports", 2: "Business", 3: "Sci/Tech"}
+VALID_LABELS = ["World", "Sports", "Business", "Sci/Tech", "None of these"]
+SAMPLE_SEED = 4371
 
+p = argparse.ArgumentParser()
+p.add_argument("--messages", default="data/messages.jsonl")
+p.add_argument("--model-dir", default="models/ag_news_pipeline")
+p.add_argument("--output-dir", default="classification_outputs")
+a = p.parse_args()
 
-os.environ["HADOOP_HOME"] = r"C:\hadoop"
-os.environ["PATH"] = (
-    r"C:\hadoop\bin" + os.pathsep + os.environ["PATH"]
-)
+os.makedirs(a.output_dir, exist_ok=True)
+predictions_dir = os.path.join(a.output_dir, "batch_predictions")
+sample_file = os.path.join(a.output_dir, "manual_labels_50.csv")
+labeled_file = os.path.join(a.output_dir, "manually_labelled_data.csv")
+results_file = os.path.join(a.output_dir, "evaluation_results.csv")
+summary_file = os.path.join(a.output_dir, "accuracy_summary.json")
 
 spark = (
     SparkSession.builder
-    .appName("BigDataGroupProject")
+    .appName("GP1-Member4-BatchClassification")
     .master("local[*]")
-    .config(
-        "spark.jars.packages",
-        "org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0"
-    )
     .getOrCreate()
 )
+spark.sparkContext.setLogLevel("WARN")
 
-# print(spark._jvm.org.apache.hadoop.util.VersionInfo.getVersion())
-# print("Spark version:", spark.version)
-
-
-msgs = spark.read.json(f"{BASE_DIR}/data/messages.jsonl").select("id", "text")
-# input_file = BASE_DIR / "data" / "messages.jsonl"
-
-# print(BASE_DIR)
-# print("Base directory exists:", os.path.isdir(BASE_DIR))
-# print("Base directory writable:", os.access(BASE_DIR, os.W_OK))
-
-MODEL_PATH = BASE_DIR / "models" / "ag_news_pipeline"
-OUTPUT_DIR = BASE_DIR / "classification_outputs"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# print("Model exists:", os.path.exists(MODEL_PATH))
-# msgs.show(truncate=False)
-news_df = msgs
-
-KAFKA_SERVERS = "YOUR_ACCESSIBLE_BROKER:9092"
-KAFKA_TOPIC = "topic1"
-
-os.environ["PYSPARK_SUBMIT_ARGS"] = (
-    "--packages "
-    "org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0"
-    "pyspark-shell"
+# ---------------------------------------------------------------
+# 1. Load and clean messages
+# ---------------------------------------------------------------
+raw = spark.read.json(a.messages).select(
+    col("id").cast("string").alias("id"),
+    col("text").cast("string").alias("text"),
 )
+raw_count = raw.count()
 
-
-kafka_stream = (
-    spark.readStream
-    .format("kafka")
-    .option(
-        "kafka.bootstrap.servers",
-        KAFKA_SERVERS
-    )
-    .option("subscribe", KAFKA_TOPIC)
-    .option("startingOffsets", "earliest")
-    .load()
-)
-
-print("Kafka source configured")
-
-# news_df.printSchema()
-# news_df.show(5, truncate=False)
-
-# print("Total messages:", news_df.count())
-
-#clean
-SOURCE_TEXT_COL = "text"
-SOURCE_ID_COL = "id"
-
-if SOURCE_TEXT_COL not in news_df.columns:
-    raise ValueError("Text column not found.")
-
-if SOURCE_ID_COL in news_df.columns:
-    clean_df = news_df.select(
-        col(SOURCE_ID_COL).cast("string").alias("id"),
-        trim(col(SOURCE_TEXT_COL).cast("string")).alias("text")
-    )
-else:
-    clean_df = news_df.select(
-        trim(col(SOURCE_TEXT_COL).cast("string")).alias("text")
-    ).withColumn(
-        "id",
-        monotonically_increasing_id().cast("string")
-    )
-
-clean_df = (
-    clean_df
-    .filter(col("text").isNotNull())
-    .filter(length(col("text")) > 0)
+clean = (
+    raw.withColumn("text", trim(col("text")))
+    .where(col("text").isNotNull() & (length(col("text")) > 0))
     .dropDuplicates(["text"])
 )
+clean_count = clean.count()
 
-print("Cleaned messages:", clean_df.count())
+print(f"RAW COUNT: {raw_count}")
+print(f"CLEAN COUNT: {clean_count} (removed {raw_count - clean_count} empty or duplicate)")
 
-clean_df.show(5, truncate=False)
+# ---------------------------------------------------------------
+# 2. Predict with the saved model
+# ---------------------------------------------------------------
+model = PipelineModel.load(a.model_dir)
 
-#model
+mapping_expr = create_map(*chain.from_iterable((lit(k), lit(v)) for k, v in LABEL_MAP.items()))
 
-model = PipelineModel.load(MODEL_PATH)
+pred = (
+    model.transform(clean)
+    .withColumn("predicted_category", mapping_expr[col("prediction").cast("int")])
+    .withColumn("confidence", array_max(vector_to_array(col("probability"))))
+)
 
-for i, stage in enumerate(model.stages):
-    print(i, type(stage).__name__)
+batch_results = pred.select("id", "text", "predicted_category", "confidence").cache()
 
-MODEL_TEXT_COL = model.stages[0].getInputCol()
+print("\nPredicted class counts:")
+batch_results.groupBy("predicted_category").count().orderBy(col("count").desc()).show()
 
-print("\nModel expects:", MODEL_TEXT_COL)
+print("Five example predictions per class:")
+for label in LABEL_MAP.values():
+    print(f"\n--- {label} ---")
+    (batch_results.where(col("predicted_category") == label)
+     .orderBy(col("confidence").desc())
+     .select("text", "confidence")
+     .show(5, truncate=85))
 
-if MODEL_TEXT_COL != "text":
-    model_input_df = clean_df.withColumn(
-        MODEL_TEXT_COL,
-        col("text")
+# escape='"' writes standard CSV quoting so the file opens correctly in Excel/pandas
+(batch_results.coalesce(1).write.mode("overwrite")
+ .option("header", True)
+ .option("escape", '"')
+ .csv(predictions_dir))
+print(f"Predictions written to {predictions_dir}/ (one part-*.csv file)")
+
+# ---------------------------------------------------------------
+# 3. 50-message sample for hand labeling
+# ---------------------------------------------------------------
+# The sample is only created once. Re-running never overwrites a sample that
+# has already been labeled.
+if not os.path.exists(labeled_file):
+    sample_pd = (
+        batch_results.orderBy(rand(seed=SAMPLE_SEED)).limit(50).toPandas()
     )
-else:
-    model_input_df = clean_df
+    if len(sample_pd) != 50:
+        raise ValueError("Need at least 50 cleaned messages.")
+    sample_pd["manual_label"] = ""
+    sample_pd.to_csv(sample_file, index=False)
+    print(f"\nSaved 50 messages to {sample_file}.")
+    print("Fill in manual_label for every row (World / Sports / Business / Sci/Tech / None of these),")
+    print(f"save the result as {labeled_file}, then run this script again.")
+    spark.stop()
+    raise SystemExit(0)
 
+# ---------------------------------------------------------------
+# 4. Evaluate the labeled sample
+# ---------------------------------------------------------------
+# sep=None sniffs comma vs semicolon (Excel in some locales saves with ';'),
+# utf-8-sig drops the hidden byte-order mark Excel adds, and column names are
+# normalized so "Manual Label" or " manual_label " still match.
+evaluation = pd.read_csv(labeled_file, sep=None, engine="python", encoding="utf-8-sig")
+evaluation.columns = [str(c).strip().lower().replace(" ", "_") for c in evaluation.columns]
 
-#real model
+missing = {"text", "predicted_category", "manual_label"} - set(evaluation.columns)
+if missing:
+    raise ValueError(
+        f"{labeled_file} is missing column(s) {sorted(missing)}. "
+        f"Columns found: {list(evaluation.columns)}. "
+        "The header row should be: id,text,predicted_category,confidence,manual_label"
+    )
 
-predictions_df = model.transform(news_df)
+evaluation["manual_label"] = evaluation["manual_label"].fillna("").astype(str).str.strip()
 
-predictions_df.select(
-    "text",
-    "prediction",
-    "probability"
-).show(10, truncate=False)
+bad = evaluation[~evaluation["manual_label"].isin(VALID_LABELS)]
+if len(evaluation) != 50 or len(bad) > 0:
+    raise ValueError(
+        f"{labeled_file} must have 50 rows, each labeled one of {VALID_LABELS}. "
+        f"Rows with missing or invalid labels: {len(bad)}"
+    )
 
-from itertools import chain
+is_none = evaluation["manual_label"] == "None of these"
+none_count = int(is_none.sum())
+eligible = evaluation[~is_none]
+if len(eligible) == 0:
+    raise ValueError("No eligible (non-None) messages to evaluate.")
 
-label_map = {
-    0: "World",
-    1: "Sports",
-    2: "Business",
-    3: "Sci/Tech"
+correct = int((eligible["manual_label"] == eligible["predicted_category"]).sum())
+accuracy = correct / len(eligible) * 100
+
+evaluation["correct"] = (evaluation["manual_label"] == evaluation["predicted_category"]).astype("boolean")
+evaluation.loc[is_none, "correct"] = pd.NA
+evaluation.to_csv(results_file, index=False)
+
+summary = {
+    "raw_messages": raw_count,
+    "clean_messages": clean_count,
+    "total_labeled": len(evaluation),
+    "none_of_these": none_count,
+    "eligible_messages": len(eligible),
+    "correct_predictions": correct,
+    "accuracy_percent": round(accuracy, 2),
 }
+with open(summary_file, "w") as f:
+    json.dump(summary, f, indent=4)
 
-mapping_expr = create_map(
-    *list(chain.from_iterable(
-        (lit(k), lit(v))
-        for k, v in label_map.items()
-    ))
-)
+print("\n=== Manual evaluation ===")
+print(f"Labeled: {len(evaluation)} | None of these: {none_count} | Eligible: {len(eligible)}")
+print(f"Accuracy: {correct}/{len(eligible)} = {accuracy:.2f}%")
 
-predictions_df = (
-    predictions_df
-    .withColumn(
-        "predicted_category",
-        mapping_expr[col("prediction").cast("int")]
-    )
-    .withColumn(
-        "confidence",
-        array_max(vector_to_array(col("probability")))
-    )
-)
+wrong = evaluation[(evaluation["correct"] == False)]  # noqa: E712
+print("\nMisclassified examples (for the report):")
+for _, r in wrong.head(5).iterrows():
+    print(f"  predicted {r['predicted_category']}, actually {r['manual_label']}: {r['text'][:90]}")
 
-batch_results = predictions_df.select(
-    "id",
-    "text",
-    "predicted_category",
-    "confidence"
-)
-
-batch_results.show(10, truncate=False)
-
-batch_results.write.mode("overwrite").option(
-    "header", True
-).csv(f"{OUTPUT_DIR}/batch_predictions")
-
-sample_pd = (
-    batch_results
-    .orderBy(rand(seed=4371))
-    .limit(50)
-    .toPandas()
-)
-
-if len(sample_pd) != 50:
-    raise ValueError("Need at least 50 cleaned messages.")
-
-sample_pd["manual_label"] = ""
-
-LABEL_FILE = f"{OUTPUT_DIR}/manual_labels_50.csv"
-
-sample_pd.to_csv(LABEL_FILE, index=False)
-
-print("Saved 50 messages:", LABEL_FILE)
-# print("\nManual Labelling will be done at this point")
-
-evaluation = pd.read_csv(f"{OUTPUT_DIR}/manually_labelled_data.csv")
-
-evaluation["manual_label"] = (
-    evaluation["manual_label"].fillna("").str.strip()
-)
-
-valid_labels = [
-    "World", "Sports", "Business",
-    "Sci/Tech", "None of these"
-]
-
-if len(evaluation) != 50 or not evaluation[
-    "manual_label"
-].isin(valid_labels).all():
-    raise ValueError("Complete all 50 manual labels first.")
-
-eligible = evaluation[
-    evaluation["manual_label"] != "None of these"
-].copy()
-
-eligible["correct"] = (
-    eligible["manual_label"]
-    == eligible["predicted_category"]
-)
-
-total = len(eligible)
-
-if total == 0:
-    raise ValueError("No eligible messages to evaluate.")
-
-correct = int(eligible["correct"].sum())
-accuracy = correct / total * 100
-
-print("Total labeled:", len(evaluation))
-print("Eligible:", total)
-print("Correct:", correct)
-print(f"Accuracy: {accuracy:.2f}%")
-
-evaluation["correct"] = (
-    evaluation["manual_label"]
-    == evaluation["predicted_category"]
-).astype("boolean")
-
-evaluation.loc[
-    evaluation["manual_label"] == "None of these",
-    "correct"
-] = pd.NA
-
-evaluation.to_csv(
-    f"{OUTPUT_DIR}/evaluation_results.csv",
-    index=False
-)
-
-with open(
-    f"{OUTPUT_DIR}/accuracy_summary.json", "w"
-) as f:
-    json.dump({
-        "total_labeled": len(evaluation),
-        "eligible_messages": total,
-        "correct_predictions": correct,
-        "accuracy_percent": round(accuracy, 2)
-    }, f, indent=4)
-
-print("Evaluation saved!")
+print(f"\nSaved {results_file} and {summary_file}")
+spark.stop()
